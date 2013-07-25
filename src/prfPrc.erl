@@ -134,14 +134,14 @@ msgq([]) -> 0;
 msgq([_,_,{message_queue_len,Msgq}]) -> Msgq.
 
 %% callbacks for app-specific info
-extra_items(Pid,Items) -> 
+extra_items(Pid,Items) ->
   lists:append([extra_item(Pid,I) || I <- Items]).
 
 extra_item(Pid,{M,F}) when is_pid(Pid) ->
   try M:F(Pid)
   catch _:_ -> []
   end;
-extra_item(_,_) -> 
+extra_item(_,_) ->
   [].
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -187,10 +187,10 @@ pidinfo(Type = initial_call) ->
        case process_info(Pid, Type) of
          {Type,{proc_lib,init_p,5}} ->
            case proc_lib:translate_initial_call(Pid) of
-             {dets,init,2} -> {dets, element(2, dets:pid2name(Pid))};
+             {dets,init,2}     -> {dets,    element(2,dets:pid2name(Pid))};
+             {disk_log,init,2} -> {disk_log,element(2,disk_log:pid2name(Pid))};
              IC -> IC
            end;
-         {Type,{dets, do_open_file, 11}} -> pinf_dets(Pid);%gone in R12
          {Type,IC} -> IC
        end
    end,
@@ -198,6 +198,3 @@ pidinfo(Type = initial_call) ->
 pidinfo(Type) ->
   {fun(Pid) -> {Type,I} = process_info(Pid, Type), I end,
    []}.
-
-pinf_dets(Pid) ->
-  {dets, element(2, dets:pid2name(Pid))}.

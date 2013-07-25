@@ -10,9 +10,10 @@
 -author('Mats Cronqvist').
 
 -export([transform/1]).
--export([unit/0]).
+-export([unit_loud/0,unit_quiet/0]).
 
--define(is_string(Str), (Str=="" orelse (9=<hd(Str) andalso hd(Str)=<255))).
+-define(is_string(Str),
+        (Str=="" orelse (9=<hd(Str) andalso hd(Str)=<255))).
 
 transform(E) ->
   compile(parse(to_string(E))).
@@ -24,28 +25,25 @@ to_string(X)                    -> exit({illegal_input,X}).
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %% compiler
 %% returns {{Module,Function,Arity},[{Head,Cond,Body}],[Flag]}
-compile({M,F,'_',[],Actions}) ->
-  {{M,F,'_'},[{'_',[],compile_acts(Actions)}],flags()};
-compile({_,_,'_',Gs,_}) ->
-  exit({guards_without_args,Gs});
+%% i.e. the args to erlang:trace_pattern/3
+
 compile({M,F,Ari,[],Actions}) when is_integer(Ari) ->
   compile({M,F,lists:duplicate(Ari,{var,'_'}),[],Actions});
-compile({M,F,As,Gs,Actions}) when is_list(As) ->
+compile({M,OF,As,Gs,Actions}) ->
+  {F,A,Flags} = chk_fa(OF,As),
   {Vars,Args} = compile_args(As),
-  {{M,F,len(F,As)},
-   [{Args,compile_guards(Gs,Vars),compile_acts(Actions)}],
-   flags()}.
+  {{M,F,A}, [{Args,compile_guards(Gs,Vars),compile_acts(Actions)}], Flags}.
 
-len('_',_) -> '_';
-len(_,As)  -> length(As).
-
-flags() -> [local].
+chk_fa('X',_) -> {'_','_',[global]};
+chk_fa('_',_) -> {'_','_',[local]};
+chk_fa(F,'_') -> {F,'_',[local]};
+chk_fa(F,As)  -> {F,length(As),[local]}.
 
 compile_acts(As) ->
   [ac_fun(A)|| A <- As].
 
 ac_fun("stack") -> {message,{process_dump}};
-ac_fun("return")-> {exception_trace};   %{return_trace}; %backward compatible?
+ac_fun("return")-> {exception_trace};
 ac_fun(X)       -> exit({unknown_action,X}).
 
 compile_guards(Gs,Vars) ->
@@ -62,6 +60,10 @@ gd_fun({Op,V1,V2},{Vars,O}) ->               % binary
 unpack_op(Op,As,Vars) ->
   list_to_tuple([Op|[unpack_var(A,Vars)||A<-As]]).
 
+unpack_var({tuple,Es},Vars) ->
+  {list_to_tuple([unpack_var(E,Vars)||E<-Es])};
+unpack_var({list,Es},Vars) ->
+  [unpack_var(E,Vars)||E<-Es];
 unpack_var({var,Var},Vars) ->
   case proplists:get_value(Var,Vars) of
     undefined -> exit({unbound_variable,Var});
@@ -69,10 +71,14 @@ unpack_var({var,Var},Vars) ->
   end;
 unpack_var({Op,As},Vars) when is_list(As) ->
   unpack_op(Op,As,Vars);
+unpack_var({Op,V1,V2},Vars) ->
+  unpack_op(Op,[V1,V2],Vars);
 unpack_var({Type,Val},_) ->
   assert_type(Type,Val),
   Val.
 
+compile_args('_') ->
+  {[{'$_','$_'}],'_'};
 compile_args(As) ->
   lists:foldl(fun ca_fun/2,{[],[]},As).
 
@@ -85,10 +91,11 @@ ca_fun({tuple,Es},{Vars,O}) ->
 ca_fun({var,'_'},{Vars,O}) ->
   {Vars,O++['_']};
 ca_fun({var,Var},{Vars,O}) ->
-  case proplists:get_value(Var,Vars) of
-    undefined -> V = list_to_atom("\$"++integer_to_list(length(Vars)+1));
-    V -> ok
-  end,
+  V =
+    case proplists:get_value(Var,Vars) of
+      undefined -> list_to_atom("\$"++integer_to_list(length(Vars)+1));
+      X -> X
+    end,
   {[{Var,V}|Vars],O++[V]};
 ca_fun({Type,Val},{Vars,O}) ->
   assert_type(Type,Val),
@@ -133,20 +140,23 @@ parse(Str) ->
 split_fun(Str) ->
   fun() ->
       % strip off the actions, if any
-      case re:run(Str,"^(.+)->\\s*([a-z;]+)\\s*\$",[{capture,[1,2],list}]) of
-        {match,[St,Action]} -> ok;
-        nomatch             -> St=Str,Action=""
-      end,
+      {St,Action} =
+        case re:run(Str,"^(.+)->\\s*([a-z;,]+)\\s*\$",[{capture,[1,2],list}]) of
+          {match,[Z,A]} -> {Z,A};
+          nomatch       -> {Str,""}
+        end,
       % strip off the guards, if any
-      case re:run(St,"^(.+[\\s)])+when\\s(.+)\$",[{capture,[1,2],list}]) of
-        {match,[S,Guard]} -> ok;
-        nomatch           -> S=St,Guard=""
-      end,
+      {S,Guard} =
+        case re:run(St,"^(.+[\\s)])+when\\s(.+)\$",[{capture,[1,2],list}]) of
+          {match,[Y,G]} -> {Y,G};
+          nomatch       -> {St,""}
+        end,
       % add a wildcard F, if Body is just an atom (presumably a module)
-      case re:run(S,"^\\s*[a-zA-Z0-9_]+\\s*\$") of
-        nomatch -> Body=S;
-        _       -> Body=S++":'_'"
-      end,
+      Body =
+        case re:run(S,"^\\s*[a-zA-Z0-9_]+\\s*\$") of
+          nomatch -> S;
+          _       -> S++":'_'"
+        end,
       {Body,Guard,Action}
   end.
 
@@ -160,10 +170,14 @@ body_fun(Str) ->
           {M,F,[arg(A) || A<-Args]};
         {ok,[{call,1,{remote,1,{atom,1,M},{var,1,'_'}},Args}]} ->
           {M,'_',[arg(A) || A<-Args]};
+        {ok,[{call,1,{remote,1,{atom,1,M},{var,1,_}},Args}]} ->
+          {M,'X',[arg(A) || A<-Args]};
         {ok,[{remote,1,{atom,1,M},{atom,1,F}}]} ->
           {M,F,'_'};
         {ok,[{remote,1,{atom,1,M},{var,1,'_'}}]} ->
           {M,'_','_'};
+        {ok,[{remote,1,{atom,1,M},{var,1,_}}]} ->
+          {M,'X','_'};
         {ok,C} ->
           exit({this_is_too_confusing,C})
      end
@@ -175,10 +189,14 @@ guards_fun(Str) ->
         "" -> [];
         _ ->
           {done,{ok,Toks,1},[]} = erl_scan:tokens([],Str++". ",1),
-          {ok,Guards} = erl_parse:parse_exprs(Toks),
+          {ok,Guards} = erl_parse:parse_exprs(disjunct_guard(Toks)),
           [guard(G)||G<-Guards]
       end
   end.
+
+%% deal with disjunct guards by replacing ';' with 'orelse'
+disjunct_guard(Toks) ->
+  [case T of {';',1} -> {'orelse',1}; _ -> T end||T<-Toks].
 
 guard({call,1,{atom,1,G},Args}) -> {G,[arg(A) || A<-Args]};   % function
 guard({op,1,Op,One,Two})        -> {Op,guard(One),guard(Two)};% unary op
@@ -186,13 +204,14 @@ guard({op,1,Op,One})            -> {Op,guard(One)};           % binary op
 guard(Guard)                    -> arg(Guard).                % variable
 
 arg({op,_,'++',{string,_,Str},Var}) -> {list,arg_list(consa(Str,Var))};
-arg({nil,_})        -> {list,[]};
-arg(L={cons,_,_,_}) -> {list,arg_list(L)};
-arg({tuple,_,Args}) -> {tuple,[arg(A)||A<-Args]};
-arg({T,_,Var})      -> {T,Var}.
+arg({call,1,F,Args}) -> guard({call,1,F,Args});
+arg({nil,_})         -> {list,[]};
+arg(L={cons,_,_,_})  -> {list,arg_list(L)};
+arg({tuple,_,Args})  -> {tuple,[arg(A)||A<-Args]};
+arg({T,_,Var})       -> {T,Var}.
 
-consa([],T) -> T;
-consa([C],T) -> {cons,1,{char,1,C},T};
+consa([],T)     -> T;
+consa([C],T)    -> {cons,1,{char,1,C},T};
 consa([C|Cs],T) -> {cons,1,{char,1,C},consa(Cs,T)}.
 
 arg_list({cons,_,H,T}) -> [arg(H)|arg_list(T)];
@@ -201,13 +220,14 @@ arg_list(V)            -> arg(V).
 
 actions_fun(Str) ->
   fun() ->
-      string:tokens(Str,";")
+      string:tokens(Str,";,")
   end.
 
 assert(Fun,Tag) ->
   try Fun()
   catch
-    _:{_,{error,{1,erl_parse,L}}}-> exit({{syntax_error,lists:flatten(L)},Tag});
+    _:{this_is_too_confusing,C}  -> exit({syntax_error,{C,Tag}});
+    _:{_,{error,{1,erl_parse,L}}}-> exit({syntax_error,{lists:flatten(L),Tag}});
     _:R                          -> exit({R,Tag,erlang:get_stacktrace()})
   end.
 
@@ -215,11 +235,25 @@ assert(Fun,Tag) ->
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %%% ad-hoc unit testing
 
+unit_loud() ->
+  lists:foreach(fun(R)->io:fwrite("~p~n",[R])end,unit()).
+
+unit_quiet() ->
+  [R||R<-unit(),is_tuple(R)].
+
 unit() ->
   lists:foldr(
-    fun(Str,O)->[unit(fun transform/1,Str)|O]end,[],
-    [{"a",
-      {{a,'_','_'},[{'_',[],[]}],[local]}}
+    fun(Str,O)->[unit(Str)|O]end,[],
+    [{"a when element(1,'$_')=/=b",
+      {{a,'_','_'},
+       [{'_',[{'=/=',{element,1,'$_'},b}],[]}],[local]}}
+     ,{"erlang when tl(hd('$_'))=={}",
+       {{erlang,'_','_'},
+        [{'_',[{'==',{tl,{hd,'$_'}},{{}}}],[]}],
+        [local]}}
+     ,{"a:b when element(1,'$_')=/=c",
+       {{a,b,'_'},
+        [{'_',[{'=/=',{element,1,'$_'},c}],[]}],[local]}}
      ,{"a",
        {{a,'_','_'},[{'_',[],[]}],[local]}}
      ,{"a->stack",
@@ -240,8 +274,10 @@ unit() ->
        {{a,b,2},[{['$1','$1'],[],[]}],[local]}}
      ,{"a:b(X,y)",
        {{a,b,2},[{['$1',y],[],[]}],[local]}}
-     ,{" a:foo()when a==b",
+     ,{"a:foo()when a==b",
        {{a,foo,0},[{[],[{'==',a,b}],[]}],[local]}}
+     ,{"a:foo when a==b",
+       {{a,foo,'_'},[{'_',[{'==',a,b}],[]}],[local]}}
      ,{"a:b(X,1)",
        {{a,b,2},[{['$1',1],[],[]}],[local]}}
      ,{"a:b(X,\"foo\")",
@@ -250,16 +286,27 @@ unit() ->
        {{x,y,2},[{[{'$1',{'$2','$1'}},'$1'],[],[]}],[local]}}
      ,{"x:y(A,[A,{B,[B,A]},A],B)",
        {{x,y,3},[{['$1',['$1',{'$2',['$2','$1']},'$1'],'$2'],[],[]}],[local]}}
-     ,{" a:foo when a==b",
-       guards_without_args}
      ,{"a:b(X,y)when is_atom(Y)",
        unbound_variable}
      ,{"x:c([string])",
        {{x,c,1},[{[[string]],[],[]}],[local]}}
      ,{"x(s)",
-       this_is_too_confusing}
+       syntax_error}
+     ,{"x-s",
+       syntax_error}
      ,{"x:c(S)when S==x;S==y",
-       {syntax_error,"syntax error before: S"}}
+       {{x,c,1},
+        [{['$1'],[{'orelse',{'==','$1',x},{'==','$1',y}}],[]}],
+        [local]}}
+     ,{"x:c(S)when (S==x)or(S==y)",
+       {{x,c,1},
+        [{['$1'],[{'or',{'==','$1',x},{'==','$1',y}}],[]}],
+        [local]}}
+     ,{"a:b(X,Y)when is_record(X,rec) and (Y==0), (X==z)",
+       {{a,b,2},
+        [{['$1','$2'],
+          [{'and',{is_record,'$1',rec},{'==','$2',0}},{'==','$1',z}],[]}],
+        [local]}}
      ,{"x:y(z)->bla",
        unknown_action}
      ,{"a:b(X,y)when not is_atom(X)",
@@ -316,12 +363,29 @@ unit() ->
      ,{"a:_->return",
        {{a,'_','_'},[{'_',[],[{exception_trace}]}],
         [local]}}
+     ,{"erlang:_({A}) when hd(A)=={}",
+       {{erlang,'_','_'},[{[{'$1'}],[{'==',{hd,'$1'},{{}}}],[]}],
+        [local]}}
+     ,{"a:X([]) -> return,stack",
+       {{a,'_','_'},
+        [{[[]],[],[{exception_trace},{message,{process_dump}}]}],
+        [global]}}
+     ,{"lists:X([a])",
+       {{lists,'_','_'},[{[[a]],[],[]}],
+        [global]}}
+     ,{"lists:X(A) when is_list(A)",
+       {{lists,'_','_'},[{['$1'],[{is_list,'$1'}],[]}],
+        [global]}}
+     ,{"lists:X",
+       {{lists,'_','_'},[{'_',[],[]}],
+        [global]}}
     ]).
 
-unit(Method,{Str,MS}) ->
-  try MS=Method(Str),Str
+unit({Str,MS}) ->
+  try MS=transform(Str),Str
   catch
     _:{MS,_}       -> Str;
+    _:{{MS,_},_}   -> Str;
     _:{{MS,_},_,_} -> Str;
-    C:R            -> {C,R,Str,erlang:get_stacktrace()}
+    _:R            -> {Str,R,MS}
   end.
